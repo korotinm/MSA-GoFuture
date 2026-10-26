@@ -1,0 +1,126 @@
+@startuml
+title GoFuture To-Be: C2 - событийная платформа и мониторинг (один регион, остальные регионы устроены так же)
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("mon", $bgColor="#E2F0D9", $borderColor="#548235", $fontColor="#000000", $legendText="Мониторинг и наблюдаемость")
+AddElementTag("stream", $bgColor="#DDEBF7", $borderColor="#2E75B6", $fontColor="#000000", $legendText="Потоковая обработка")
+AddRelTag("mon_rel", $lineColor="#548235", $textColor="#385723", $lineStyle=DashedLine(), $legendText="Сбор метрик, логов, трейсов")
+AddRelTag("mirror", $lineColor="#7030A0", $textColor="#7030A0", $lineStyle=BoldLine(), $legendText="Межрегиональная репликация")
+
+Person(sre, "SRE / дежурный", "Реагирует на алерты, разбирает инциденты")
+
+System_Boundary(region, "Регион (пример: SGP). Отдельный Kafka-кластер на регион: 3 зоны доступности, RF=3, min.insync.replicas=2") {
+
+    Boundary(producers, "Доменные сервисы (продюсеры и потребители)") {
+        Container(booking, "Booking Service", "Python", "Оркестратор саги бронирования. Outbox, таблица saga_instance с дедлайнами")
+        Container(dispatch, "Dispatch Service", "Go", "Подбор водителя, отложенное назначение. Локальные проекции заказов и водителей (consumer + Redis)")
+        Container(driver_svc, "Driver Service", "Python", "Статусы водителей")
+        Container(geo, "Geography Service", "Go", "Приём локаций, гео-индекс")
+        Container(pricing, "Pricing Service", "Python", "Правила тарифов, surge по ячейкам")
+        Container(payments, "Payments Service", "Python", "Холд, capture, возвраты, выплаты. Outbox")
+        Container(fraud, "Fraud Service", "Python + ML-serving", "Скоринг, обновление признаков")
+        Container(notification, "Notification Service", "Python", "Fan-out уведомлений")
+    }
+
+    Container(connect, "Kafka Connect + Debezium", "Debezium", "Читает outbox-таблицы сервисов, публикует события (at-least-once, ключ = агрегат). S3 Sink для архива", $tags="stream")
+    Container(flink, "Flink Cluster", "Apache Flink", "Job ZoneStats: окна 10 с по H3-ячейкам (спрос и предложение, горячие зоны). Job FraudFeatures: признаки. Exactly-once, checkpoints в объектное хранилище", $tags="stream")
+    Container(schema_reg, "Schema Registry", "Protobuf / Avro", "Контракты событий, совместимость BACKWARD")
+
+    System_Boundary(kafka, "Apache Kafka (региональный кластер)") {
+        ContainerQueue(t_booking, "booking.events.v1", "ключ booking_id, 48 парт., 7 д", "BookingCreated, BookingConfirmed, BookingCancelled, TripStarted, TripCompleted")
+        ContainerQueue(t_loc, "driver.location.v1", "ключ driver_id, 64 парт., 24 ч", "DriverLocationUpdated. acks=1, допускается потеря")
+        ContainerQueue(t_drv, "driver.events.v1", "ключ driver_id, 24 парт., 7 д", "DriverStatusChanged")
+        ContainerQueue(t_zone, "geo.zone-stats.v1", "ключ h3_cell, 12 парт., compact", "ZoneDemandChanged: спрос, предложение по ячейкам")
+        ContainerQueue(t_surge, "pricing.surge.v1", "ключ h3_cell, 12 парт., compact", "SurgeUpdated")
+        ContainerQueue(t_dcmd, "dispatch.commands.v1", "ключ booking_id, 24 парт., 3 д", "DriverSearchRequested, DriverSearchCancelled")
+        ContainerQueue(t_devt, "dispatch.events.v1", "ключ booking_id, 24 парт., 7 д", "DriverOfferSent, DriverAssigned, DriverNotFound")
+        ContainerQueue(t_pcmd, "payments.commands.v1", "ключ booking_id, 12 парт., 7 д", "PaymentAuthorizationRequested, PaymentHoldReleaseRequested, PaymentCaptureRequested")
+        ContainerQueue(t_pevt, "payments.events.v1", "ключ booking_id, 12 парт., 30 д", "PaymentAuthorized, PaymentAuthorizationFailed, PaymentCaptured, PayoutCompleted")
+        ContainerQueue(t_fraud, "fraud.events.v1", "ключ subject_id, 12 парт., 7 д", "FraudCheckPassed, FraudCheckRejected")
+        ContainerQueue(t_notif, "notification.requests.v1", "ключ user_id, 24 парт., 3 д", "NotificationRequested")
+        ContainerQueue(t_retry, "*.retry.1m / *.retry.10m / *.dlq", "ключ как у основного топика", "Повторы с задержкой и карантин необработанных сообщений")
+    }
+
+    System_Boundary(mon, "Мониторинг событийной платформы") {
+        Container(exporters, "Exporters", "JMX Exporter, KMinion, Flink Prometheus reporter, Debezium JMX", "Метрики брокеров, лаг консьюмеров, Flink, Connect", $tags="mon")
+        Container(otel, "OpenTelemetry Collector", "OTel", "Приём метрик, логов и трейсов сервисов, пропагация trace_id через заголовки Kafka", $tags="mon")
+        Container(prom, "Prometheus", "Prometheus", "Метрики региона, recording rules, SLO-правила", $tags="mon")
+        Container(thanos, "Thanos / VictoriaMetrics", "Long-term storage", "Долгое хранение и глобальный вид по регионам", $tags="mon")
+        Container(loki, "Loki", "Loki", "Логи (структурированные, trace_id)", $tags="mon")
+        Container(tempo, "Tempo", "Grafana Tempo", "Распределённые трейсы", $tags="mon")
+        Container(grafana, "Grafana", "Grafana", "Дашборды: Kafka, Flink, saga, бизнес-SLI", $tags="mon")
+        Container(alertmgr, "Alertmanager + On-call", "Alertmanager", "Маршрутизация алертов, эскалация дежурному", $tags="mon")
+        Container(akhq, "Kafka UI", "AKHQ", "Просмотр топиков, групп и DLQ", $tags="mon")
+    }
+
+    ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Аналитика, события для BI и ML (Task4)")
+    ContainerDb(s3, "Объектное хранилище", "S3-совместимое", "Архив событий, checkpoints Flink")
+}
+
+System_Boundary(other, "Другие кластеры") {
+    ContainerQueue(kafka_dr, "Kafka парного региона (DR)", "MirrorMaker 2", "Реплика критических топиков (booking, payments, dispatch)")
+    ContainerQueue(kafka_global, "Global Analytics Kafka", "MirrorMaker 2", "Обезличенные агрегаты и события со всех регионов")
+}
+
+Rel(booking, t_booking, "Outbox -> событие", "Debezium")
+Rel(driver_svc, t_drv, "Outbox -> событие")
+Rel(geo, t_loc, "Пачки позиций (linger 20 мс, zstd)")
+Rel(payments, t_pevt, "Outbox -> событие")
+Rel(dispatch, t_devt, "Outbox -> событие")
+Rel(pricing, t_surge, "SurgeUpdated")
+Rel(fraud, t_fraud, "FraudCheck*")
+
+Rel(booking, t_dcmd, "Команда: DriverSearchRequested")
+Rel(booking, t_pcmd, "Команда: PaymentAuthorizationRequested, компенсация")
+Rel(t_pcmd, payments, "Потребляет команды")
+Rel(t_dcmd, dispatch, "Потребляет команды")
+Rel(t_pevt, booking, "Ответы саги")
+Rel(t_devt, booking, "Ответы саги")
+
+Rel(t_booking, dispatch, "Проекция заказов")
+Rel(t_drv, dispatch, "Статусы водителей")
+Rel(t_loc, geo, "Обновление гео-индекса")
+Rel(t_loc, flink, "Event-time окна")
+Rel(t_booking, flink, "Спрос по ячейкам")
+Rel(flink, t_zone, "ZoneDemandChanged (exactly-once)")
+Rel(t_zone, pricing, "Surge-расчёт")
+Rel(t_zone, dispatch, "Антигорячие зоны")
+Rel(t_surge, pricing, "Кеш surge для котировки")
+Rel(t_booking, fraud, "Признаки")
+Rel(t_pevt, fraud, "Признаки")
+Rel(booking, t_notif, "NotificationRequested")
+Rel(t_notif, notification, "Потребляет")
+
+Rel(connect, t_booking, "Outbox relay")
+Rel(connect, s3, "S3 Sink (архив)")
+Rel(kafka, clickhouse, "ClickHouse Sink")
+Rel(flink, s3, "Checkpoints")
+Rel(kafka, kafka_dr, "MirrorMaker 2: critical-топики", $tags="mirror")
+Rel(kafka, kafka_global, "MirrorMaker 2: агрегаты без PII", $tags="mirror")
+Rel(kafka, schema_reg, "Регистрация и проверка схем")
+
+Rel(exporters, prom, "Scrape", $tags="mon_rel")
+Rel(otel, prom, "Метрики сервисов (OTLP)", $tags="mon_rel")
+Rel(otel, loki, "Логи", $tags="mon_rel")
+Rel(otel, tempo, "Трейсы", $tags="mon_rel")
+Rel(prom, thanos, "Remote write", $tags="mon_rel")
+Rel(prom, alertmgr, "Алерты", $tags="mon_rel")
+Rel(grafana, thanos, "Запросы метрик", $tags="mon_rel")
+Rel(grafana, loki, "Запросы логов", $tags="mon_rel")
+Rel(grafana, tempo, "Запросы трейсов", $tags="mon_rel")
+Rel(kafka, exporters, "JMX, лаг групп", $tags="mon_rel")
+Rel(flink, exporters, "Метрики джобов", $tags="mon_rel")
+Rel(connect, exporters, "Метрики коннекторов", $tags="mon_rel")
+Rel(booking, otel, "Метрики, логи, трейсы", $tags="mon_rel")
+
+Rel(alertmgr, sre, "Уведомление дежурного")
+Rel(sre, grafana, "Использует")
+Rel(sre, akhq, "Разбор DLQ и лагов")
+
+SHOW_LEGEND()
+@enduml
