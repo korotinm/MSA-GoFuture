@@ -1,0 +1,126 @@
+@startuml
+title GoFuture To-Be: C2 с защитой периметра и мультирегионом (КРАСНЫМ выделены изменения Task3)
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("new", $bgColor="#FFD9D9", $borderColor="#FF0000", $fontColor="#7A0000", $legendText="НОВОЕ в Task3")
+AddElementTag("changed", $borderColor="#FF0000", $borderThickness="4", $legendText="ИЗМЕНЕНО в Task3 (красная рамка)")
+AddRelTag("new_rel", $lineColor="#FF0000", $textColor="#FF0000", $lineThickness="3", $legendText="Новая связь Task3")
+
+Person(passenger, "Пассажир / водитель / менеджер", "Клиенты платформы")
+Person(admin, "Администратор, SRE, поддержка", "Привилегированный доступ")
+
+Container(pax_app, "Мобильные и веб-клиенты", "iOS / Android / Huawei / Web", "Список региональных endpoint с failover на стороне клиента", $tags="changed")
+
+Boundary(edge, "Глобальный периметр") {
+    Container(geodns, "Geo DNS / Global Traffic Manager", "Anycast DNS, health checks", "Latency + geo маршрутизация, TTL 30 с, второй DNS-провайдер", $tags="new")
+    Container(waf, "Edge: CDN + WAF + DDoS", "Anycast-сеть", "OWASP CRS, проверка по OpenAPI-схеме, bot management, rate limit по IP и тенанту, защита L3/L4/L7, TLS 1.3", $tags="new")
+    Container(zt, "Zero Trust Access Proxy", "IAP / ZTNA", "Доступ админов и SRE: MFA, устройства, время жизни сессии", $tags="new")
+}
+
+System_Boundary(region, "Регион (SGP, JKT, GRU, SCL: одинаковый шаблон). Отказоустойчивый кластер на 3 зонах") {
+
+    Container(fw, "Региональный Firewall", "NGFW / Security Groups", "Приём только от диапазонов edge. Egress allowlist по FQDN: PSP, карты, push", $tags="new")
+    Container(ingress, "Regional Load Balancer / Ingress", "L7 LB, TLS", "Терминация TLS, mTLS до шлюза, health endpoint для GeoDNS", $tags="new")
+    Container(gw, "API Gateway", "Envoy / Kong", "JWT-валидация, rate limit и квоты по тенанту, OPA-политики, WAF-правила второго уровня", $tags="changed")
+    Container(iam, "IAM", "Keycloak", "Пользователи региона (резидентность). Каталог маршрутизации user_id -> home_region без PII", $tags="changed")
+
+    Boundary(mesh, "Service Mesh (Istio): mTLS, AuthorizationPolicy, NetworkPolicy default-deny") {
+        Container(booking, "Booking", "Python", "Оркестратор саги")
+        Container(dispatch, "Dispatch", "Go", "Подбор водителя")
+        Container(driver_svc, "Driver", "Python", "Профили и статусы")
+        Container(geo, "Geography", "Go", "Приём локаций")
+        Container(pricing, "Pricing", "Python", "Котировки, surge")
+        Container(payments, "Payments", "Python", "Холды, выплаты, абстракция провайдера")
+        Container(fraud, "Fraud", "Python + ML", "Скоринг")
+        Container(notification, "Notification", "Python", "Push, SMS")
+        Container(analytics, "Analytics", "Python / Flink", "Агрегаты, витрины")
+    }
+
+    Container(egress, "Egress Gateway", "Envoy", "Единственный выход к внешним провайдерам: allowlist, mTLS к внутренним, аудит вызовов", $tags="new")
+
+    ContainerDb(pg, "PostgreSQL по сервисам", "Patroni, 3 зоны", "Синхронная реплика в соседней зоне (RPO 0). TDE и шифрование томов ключами региона")
+    ContainerQueue(kafka, "Kafka региона", "RF=3, MM2", "События, outbox")
+    ContainerDb(redis, "Redis Cluster", "Geo-индекс", "Не реплицируется между регионами")
+    ContainerDb(ch, "ClickHouse", "ReplicatedMergeTree", "Аналитика региона")
+
+    Container(vault, "Vault + KMS", "HashiCorp Vault, облачный KMS", "Секреты, динамические креды БД, PKI для mTLS, ключи шифрования региона (envelope encryption)", $tags="new")
+    Container(siem, "Security Monitoring / SIEM", "Falco, audit logs, SIEM", "События безопасности, аудит доступа. Журнал в WORM-хранилище", $tags="new")
+    Container(obs, "Observability", "Prometheus, Grafana, Loki, Tempo", "Метрики, логи, трейсы региона", $tags="changed")
+    Container(cicd, "CI/CD", "Jenkins + Argo CD", "Каскадный выкат по регионам (одна ячейка за раз), security gates: SAST, SCA, сканирование образов, подпись cosign", $tags="changed")
+}
+
+System_Boundary(dr, "Парный регион (DR), тот же шаблон") {
+    ContainerDb(pg_dr, "Реплика PostgreSQL", "Streaming replication", "Hot standby всех операционных БД региона", $tags="new")
+    ContainerQueue(kafka_dr, "Kafka DR", "MirrorMaker 2", "Зеркало критичных топиков с трансляцией офсетов", $tags="new")
+    Container(app_dr, "Стек сервисов (warm)", "Kubernetes", "Прогретая ёмкость 150% собственного пика, автоскейл", $tags="new")
+}
+
+System_Boundary(global, "Глобальный контур (только данные без PII)") {
+    ContainerDb(cp_db, "Control Plane DB", "PostgreSQL, logical replication", "Тенанты, тарифные правила, флаги. Один писатель, реплики в регионах", $tags="new")
+    ContainerQueue(kafka_global, "Global Analytics Kafka + DWH", "Kafka, ClickHouse", "Обезличенные агрегаты со всех регионов", $tags="new")
+}
+
+System_Ext(psp, "Платёжные провайдеры", "Локальные PSP и Яндекс Пэй")
+System_Ext(maps, "Картографические сервисы", "Локальные и Яндекс Карты")
+System_Ext(push, "Push-сервисы", "FCM, APNS, Huawei Push Kit")
+System_Ext(bank, "API банков", "Выплаты")
+
+Rel(passenger, pax_app, "Использует")
+Rel(pax_app, geodns, "1. Резолв api.gofuture.com", "DNS", $tags="new_rel")
+Rel(pax_app, waf, "2. HTTPS / WebSocket", "TLS 1.3", $tags="new_rel")
+Rel(geodns, waf, "Ближайший здоровый edge", $tags="new_rel")
+Rel(waf, fw, "3. Очищенный трафик, только через edge", $tags="new_rel")
+Rel(fw, ingress, "4. Разрешённые порты", $tags="new_rel")
+Rel(ingress, gw, "5. mTLS", $tags="new_rel")
+Rel(gw, iam, "OIDC, JWT")
+Rel(admin, zt, "MFA, устройство", $tags="new_rel")
+Rel(zt, gw, "Админ-API, Grafana, Argo CD", $tags="new_rel")
+
+Rel(gw, booking, "REST / gRPC, mTLS")
+Rel(gw, driver_svc, "REST, mTLS")
+Rel(gw, geo, "Приём локаций")
+Rel(gw, payments, "REST, mTLS")
+Rel(booking, pricing, "gRPC")
+Rel(booking, fraud, "gRPC")
+Rel(dispatch, geo, "gRPC")
+Rel(booking, kafka, "Команды и события")
+Rel(geo, kafka, "Локации")
+Rel(kafka, dispatch, "События")
+Rel(kafka, analytics, "События")
+Rel(kafka, notification, "Запросы уведомлений")
+Rel(booking, pg, "SQL")
+Rel(payments, pg, "SQL")
+Rel(geo, redis, "GEO-индекс")
+Rel(analytics, ch, "Запись и чтение")
+
+Rel(payments, egress, "Вызовы PSP и банков", $tags="new_rel")
+Rel(geo, egress, "Вызовы карт", $tags="new_rel")
+Rel(notification, egress, "Push", $tags="new_rel")
+Rel(egress, fw, "Исходящий allowlist", $tags="new_rel")
+Rel(fw, psp, "Только разрешённые FQDN", $tags="new_rel")
+Rel(fw, maps, "Только разрешённые FQDN", $tags="new_rel")
+Rel(fw, push, "Только разрешённые FQDN", $tags="new_rel")
+Rel(fw, bank, "Только разрешённые FQDN", $tags="new_rel")
+
+Rel(booking, vault, "Секреты и ключи", $tags="new_rel")
+Rel(payments, vault, "Секреты и ключи", $tags="new_rel")
+Rel(pg, vault, "Ключи шифрования (KMS)", $tags="new_rel")
+Rel(mesh, siem, "Аудит и события безопасности", $tags="new_rel")
+Rel(gw, siem, "Логи доступа", $tags="new_rel")
+Rel(waf, siem, "События WAF", $tags="new_rel")
+Rel(mesh, obs, "Метрики, логи, трейсы")
+
+Rel(pg, pg_dr, "Асинхронная репликация, RPO <= 5 с", $tags="new_rel")
+Rel(kafka, kafka_dr, "MirrorMaker 2: booking, payments, dispatch", $tags="new_rel")
+Rel(cp_db, gw, "Реплика Control Plane (read-only): тенанты, тарифы, флаги", $tags="new_rel")
+Rel(kafka, kafka_global, "Агрегаты без PII", $tags="new_rel")
+Rel(pg_dr, app_dr, "Promote при отказе региона", $tags="new_rel")
+Rel(cicd, mesh, "Канареечный выкат по ячейкам")
+
+SHOW_LEGEND()
+@enduml
