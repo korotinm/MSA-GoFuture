@@ -1,0 +1,83 @@
+@startuml
+title Онбординг нового партнёра: автоматизированный процесс (Temporal workflow, шаги O1-O10)
+
+skinparam defaultFontName Arial
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+
+actor "Администратор\nпартнёра" as pa
+participant "Partner Portal" as pp
+participant "Onboarding\nOrchestrator" as orc
+participant "Tenant Service" as ts
+participant "KYB-провайдер" as kyb
+actor "Compliance\nofficer" as co
+participant "IAM (Keycloak)" as iam
+participant "Provisioning\nController" as prov
+participant "Хранилища\n(PG, Kafka, KMS)" as st
+participant "Control Plane\n(конфигурация)" as cfg
+participant "Мониторинг\n(Grafana, Alertmanager)" as mon
+participant "Sandbox / сервисы" as sbx
+participant "Notification" as nt
+
+pa -> pp : O1. Заявка: компания, страна, тариф, функции, IdP
+pp -> orc : O2. StartOnboarding(application_id)
+orc -> ts : O2. CreateTenant(status=PENDING, region, tier=pool|silo)
+ts --> orc : tenant_id
+
+group O3. Проверка и допуск (часы - дни, человек в контуре)
+  orc -> kyb : VerifyCompany (async)
+  kyb --> orc : webhook: результат и риск-скор
+  alt высокий риск или несоответствие
+    orc -> co : HumanTask: ручная проверка
+    co --> orc : одобрить / отклонить
+  end
+  alt отклонено
+    orc -> ts : status=REJECTED
+    orc -> nt : уведомление партнёру
+    note right of orc : конец процесса, ресурсы не создавались
+  end
+end
+
+group O4. Регион и тариф изоляции (автоматически, секунды)
+  orc -> cfg : GetCountryPolicy(country)
+  cfg --> orc : регион, DR-схема, класс изоляции, допустимые PSP и карты
+end
+
+group O5-O8. Провижининг (минуты, идемпотентные шаги)
+  orc -> iam : O5. CreateOrganization, роли, группы, SSO-брокер (метаданные IdP), SCIM-токен, OAuth-клиенты
+  iam --> orc : ok
+  orc -> prov : O6. Provision(tenant_id, tier)
+  alt tier = pool
+    prov -> st : RLS-политики и роли, квоты Kafka, row policy ClickHouse, префикс S3 и ключ данных
+  else tier = silo
+    prov -> st : выделенный кластер PG, топики t.<tenant>.*, ACL, отдельный ключ KMS (BYOK по желанию), namespace
+  end
+  st --> prov : ok
+  prov --> orc : ресурсы готовы (drift check пройден)
+  orc -> cfg : O7. ApplyConfig(тарифы, провайдеры, шаблоны, флаги, брендинг)
+  cfg --> orc : ok
+  orc -> mon : O8. Provision дашбордов SLA, алертов, SLO, синтетических проб, меток tenant_id
+  mon --> orc : ok
+end
+
+group O9-O10. Проверка и запуск
+  orc -> sbx : O9. Smoke-тест: синтетический заказ в песочнице + тест изоляции (токен тенанта A к данным тенанта B)
+  sbx --> orc : результат
+  alt тесты не прошли
+    orc -> prov : Compensate: Deprovision (в обратном порядке)
+    orc -> ts : status=FAILED
+    orc -> nt : алерт SRE и уведомление партнёру
+  else успех
+    orc -> ts : O10. Activate(status=ACTIVE), событие TenantOnboarded
+    orc -> nt : доступ, ссылки на портал, SSO и ключи API
+    nt --> pa : письмо
+  end
+end
+
+note over orc
+  Каждый шаг идемпотентен и повторяется с backoff.
+  Состояние хранится в Temporal, процесс переживает рестарты.
+  Любая ошибка после провижининга запускает компенсацию.
+  Метрики: время по шагам, доля неуспешных, зависшие workflow.
+end note
+@enduml

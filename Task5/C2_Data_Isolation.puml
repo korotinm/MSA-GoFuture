@@ -1,0 +1,61 @@
+@startuml
+title GoFuture To-Be: C2 - модель изоляции данных тенантов (pool и silo)
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("pool", $bgColor="#DDEBF7", $borderColor="#2E75B6", $fontColor="#000000", $legendText="Pool: общая инфраструктура, логическая изоляция")
+AddElementTag("silo", $bgColor="#FCE4D6", $borderColor="#C55A11", $fontColor="#000000", $legendText="Silo: выделенные ресурсы тенанта")
+AddRelTag("ctx", $lineColor="#7030A0", $textColor="#7030A0", $lineStyle=DashedLine(), $legendText="Передача контекста тенанта")
+
+Person(user_a, "Пользователь тенанта A (pool)", "JWT: tenant_id=A")
+Person(user_b, "Пользователь тенанта B (pool)", "JWT: tenant_id=B")
+Person(user_c, "Пользователь тенанта C (silo)", "JWT: tenant_id=C")
+
+Container(gw, "API Gateway", "Envoy / Kong", "Проверяет JWT, определяет tenant_id, запрещает передачу tenant_id клиентом, подписывает x-tenant-id, квоты")
+Container(opa, "Policy Decision Point", "OPA", "tenant_id запроса должен совпасть с tenant_id ресурса")
+ContainerDb(registry, "Tenant Registry", "PostgreSQL (Control Plane)", "tenant_id -> tier, регион, строки подключения, ключи")
+
+Container(svc, "Доменный сервис (tenant-aware)", "Python / Go", "Библиотека tenant-context: на каждом запросе выбирает ресурсы по реестру и ставит контекст тенанта в БД, топик и кэш")
+
+System_Boundary(pool, "Pool: общие ресурсы для тенантов A и B") {
+    ContainerDb(pg_pool, "PostgreSQL", "RLS", "tenant_id во всех таблицах. Политика: tenant_id = current_setting('app.tenant_id'). Роль приложения без BYPASSRLS", $tags="pool")
+    ContainerQueue(k_pool, "Kafka: общие топики", "Kafka", "tenant_id в конверте. Квоты producer_byte_rate по клиенту. ACL по сервисам", $tags="pool")
+    ContainerDb(redis_pool, "Redis", "ACL + префикс", "Ключи t:{tenant}:..., ACL на пространство ключей сервиса", $tags="pool")
+    ContainerDb(ch_pool, "ClickHouse", "Row policy", "Row policy по tenant_id, квоты запросов, BI-роль read-only", $tags="pool")
+    ContainerDb(s3_pool, "Объектное хранилище", "SSE-KMS", "Префикс tenant/{id}/, ключ данных тенанта (обёрнут ключом региона)", $tags="pool")
+}
+
+System_Boundary(silo, "Silo: выделенные ресурсы тенанта C") {
+    ContainerDb(pg_silo, "PostgreSQL (выделенный)", "Patroni", "Отдельный кластер, отдельные креды из Vault", $tags="silo")
+    ContainerQueue(k_silo, "Kafka: t.C.*", "Kafka", "Выделенные топики, ACL только на сервис-аккаунты тенанта, квоты", $tags="silo")
+    ContainerDb(redis_silo, "Redis (выделенный)", "Redis", "Отдельный инстанс", $tags="silo")
+    ContainerDb(ch_silo, "ClickHouse (выделенная БД)", "ClickHouse", "Отдельная БД и пользователи", $tags="silo")
+    ContainerDb(s3_silo, "Бакет тенанта", "SSE-KMS", "Отдельный бакет и ключ CMK тенанта (BYOK по желанию)", $tags="silo")
+}
+
+Container(kms, "Vault + KMS", "Vault / KMS", "Региональный ключ, ключи данных тенантов, CMK для silo, динамические креды БД")
+
+Rel(user_a, gw, "HTTPS")
+Rel(user_b, gw, "HTTPS")
+Rel(user_c, gw, "HTTPS")
+Rel(gw, opa, "Решение по запросу")
+Rel(gw, svc, "mTLS, x-tenant-id", $tags="ctx")
+Rel(svc, registry, "Какой tier и ресурсы у тенанта (кэш)")
+Rel(svc, pg_pool, "A, B: SET app.tenant_id", $tags="ctx")
+Rel(svc, k_pool, "A, B: событие с tenant_id", $tags="ctx")
+Rel(svc, redis_pool, "A, B: ключи t:{tenant}", $tags="ctx")
+Rel(svc, s3_pool, "A, B", $tags="ctx")
+Rel(k_pool, ch_pool, "Sink")
+Rel(svc, pg_silo, "C: прямое подключение к выделенному кластеру", $tags="ctx")
+Rel(svc, k_silo, "C: топики t.C.*", $tags="ctx")
+Rel(svc, redis_silo, "C", $tags="ctx")
+Rel(svc, s3_silo, "C", $tags="ctx")
+Rel(k_silo, ch_silo, "Sink")
+Rel(svc, kms, "Ключи данных, креды")
+
+SHOW_LEGEND()
+@enduml
