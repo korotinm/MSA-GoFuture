@@ -1,0 +1,71 @@
+@startuml
+title GoFuture To-Be: C4 (Deployment) - аварийное переключение пары SGP - JKT. Красным помечены точки отказа F1-F10
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("fp", $bgColor="#FFD9D9", $borderColor="#FF0000", $fontColor="#7A0000", $legendText="Точка отказа (Fn = строка таблицы сценариев)")
+AddRelTag("repl", $lineColor="#7030A0", $textColor="#7030A0", $lineStyle=DashedLine(), $lineThickness="2", $legendText="Асинхронная репликация")
+AddRelTag("switch", $lineColor="#C00000", $textColor="#C00000", $lineStyle=BoldLine(), $legendText="Путь переключения при отказе региона")
+
+Person(user, "Пользователь", "Приложение с несколькими endpoint")
+
+Deployment_Node(edge, "Глобальный edge", "Anycast, выдерживает отказ любого региона") {
+    Container(geodns, "Geo DNS + Health Checker", "F9: отказ DNS-провайдера, F10: ложные срабатывания", "Пробы /healthz, исключение региона из ответов, TTL 30 с. Второй DNS-провайдер", $tags="fp")
+    Container(waf, "CDN + WAF", "F8: DDoS / перегрузка", "Scrubbing, rate limit. Режим under-attack", $tags="fp")
+}
+
+Deployment_Node(sgp, "Регион SGP", "PRIMARY для SG, MY, TH, VN, PH. Прогретая ёмкость 150% своего пика") {
+    Deployment_Node(sgp_k8s, "Kubernetes (3 зоны)", "F1: отказ пода или ноды, F2: отказ зоны") {
+        Container(sgp_ing, "Ingress + Gateway", "F6: отказ ingress региона", "Второй набор в другой зоне", $tags="fp")
+        Container(sgp_svc, "Tier-0 сервисы", "Booking, Dispatch, Driver, Geography, Pricing, Payments", "PDB, HPA, anti-affinity по зонам", $tags="fp")
+    }
+    Deployment_Node(sgp_data, "Данные (3 зоны)", "") {
+        ContainerDb(sgp_pg, "PostgreSQL Patroni", "F3: отказ лидера", "Лидер + синхронная реплика. Автоматический promote за < 30 с", $tags="fp")
+        ContainerQueue(sgp_k, "Kafka", "F4: отказ брокера или зоны", "RF=3, min ISR=2. Новый лидер партиций за секунды", $tags="fp")
+        ContainerDb(sgp_redis, "Redis Geo", "F5: потеря индекса", "Реплики по зонам. Полная потеря: пересборка из потока за 1-2 мин", $tags="fp")
+    }
+}
+
+Deployment_Node(jkt, "Регион JKT", "PRIMARY для ID, DR для SGP. Прогретая ёмкость 150% своего пика, остальное автоскейлом") {
+    Deployment_Node(jkt_k8s, "Kubernetes (3 зоны)", "Недостающие 50% до двойной нагрузки добираются автоскейлом нод, Tier-1 нагрузка временно урезается") {
+        Container(jkt_ing, "Ingress + Gateway", "", "Принимает трафик SGP при failover")
+        Container(jkt_svc, "Tier-0 сервисы (+ контур SGP в standby)", "Те же сервисы, конфигурация ячейки sgp отключена", "Активируется контроллером failover")
+    }
+    Deployment_Node(jkt_data, "Данные (3 зоны)", "") {
+        ContainerDb(jkt_pg, "Hot standby БД SGP", "PostgreSQL replica", "Promote при отказе SGP. RPO <= лаг репликации (цель <= 5 с)")
+        ContainerQueue(jkt_k, "Kafka JKT + зеркало SGP", "MirrorMaker 2", "Критичные топики SGP с трансляцией офсетов")
+    }
+}
+
+Deployment_Node(ctrl, "Контур управления отказом", "Развёрнут в 3 независимых локациях") {
+    Container(arbiter, "Failover Controller + Arbiter (etcd/Consul quorum)", "F7: отказ региона целиком, F7a: сетевой раскол", "Решение о переключении по кворуму из 3 локаций, fencing старого лидера. Автоматика с ручным подтверждением для данных, если лаг репликации > 30 с", $tags="fp")
+    ContainerDb(cp, "Control Plane DB", "Один писатель, standby в другом континенте", "Тенанты, тарифы, флаги. Регионы работают на кэше при недоступности")
+}
+
+Rel(user, geodns, "Резолв")
+Rel(user, waf, "HTTPS")
+Rel(waf, sgp_ing, "Трафик SG, MY, TH, VN, PH")
+Rel(waf, jkt_ing, "Трафик ID и резерв SGP", $tags="switch")
+Rel(sgp_ing, sgp_svc, "mTLS")
+Rel(sgp_svc, sgp_pg, "SQL")
+Rel(sgp_svc, sgp_k, "События")
+Rel(sgp_svc, sgp_redis, "Гео-индекс")
+Rel(jkt_ing, jkt_svc, "mTLS")
+
+Rel(sgp_pg, jkt_pg, "Streaming replication", $tags="repl")
+Rel(sgp_k, jkt_k, "MirrorMaker 2", $tags="repl")
+Rel(jkt_pg, sgp_pg, "Streaming replication (обратная пара)", $tags="repl")
+
+Rel(arbiter, geodns, "1. Вывести SGP из ответов DNS и edge", $tags="switch")
+Rel(arbiter, sgp_pg, "2. Fencing старого лидера", $tags="switch")
+Rel(arbiter, jkt_pg, "3. Promote реплики SGP-БД", $tags="switch")
+Rel(arbiter, jkt_svc, "4. Включить ячейку sgp, потребление с трансл. офсетов", $tags="switch")
+Rel(cp, sgp_svc, "Конфигурация (кэш)")
+Rel(cp, jkt_svc, "Конфигурация (кэш)")
+
+SHOW_LEGEND()
+@enduml

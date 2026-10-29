@@ -1,0 +1,133 @@
+@startuml
+title GoFuture To-Be: C4 (Container) - единая платформа данных: от микросервисов к ML-платформе и BI
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("dq", $bgColor="#E2F0D9", $borderColor="#548235", $fontColor="#000000", $legendText="Качество данных и управление")
+AddElementTag("ml", $bgColor="#FFF2CC", $borderColor="#BF9000", $fontColor="#000000", $legendText="ML-платформа")
+AddElementTag("bi", $bgColor="#DDEBF7", $borderColor="#2E75B6", $fontColor="#000000", $legendText="BI")
+AddRelTag("hot", $lineColor="#C00000", $textColor="#C00000", $lineThickness="3", $legendText="Горячий путь (секунды)")
+AddRelTag("gov", $lineColor="#548235", $textColor="#385723", $lineStyle=DashedLine(), $legendText="Контроль качества, lineage, каталог")
+
+Person(ds, "Data Scientist / ML-инженер", "Обучает и выкладывает модели")
+Person(analyst, "Аналитик / менеджер", "Отчёты и дашборды")
+
+System_Boundary(region, "Регион (пример: SGP). Данные P1 с PII остаются здесь") {
+
+    Boundary(src, "Источники данных") {
+        Container(svc, "Доменные микросервисы", "Booking, Driver, Dispatch, Pricing, Payments, Fraud, Geography", "Доменные события через outbox и Debezium (Task2)")
+        ContainerDb(oltp, "OLTP БД сервисов и legacy-монолит", "PostgreSQL", "Справочники и таблицы без событий")
+        Container(apps, "Клиентская телеметрия", "iOS / Android / Web", "События экранов, ошибки, сетевые метрики через API Gateway")
+        Container(ext, "Внешние данные", "Batch API", "Трафик и погода, праздники и события города, курсы валют")
+    }
+
+    ContainerQueue(kafka, "Kafka региона (raw)", "Kafka", "booking.*, driver.*, payments.*, app.events, cdc.*")
+    Container(cdc, "CDC", "Debezium", "Изменения таблиц OLTP и legacy-монолита", $tags="dq")
+    Container(sreg, "Schema Registry + Data Contracts", "Protobuf, protovalidate", "Версии схем, семантические ограничения (диапазоны, обязательность, enum)", $tags="dq")
+    Container(validator, "Stream Validator", "Apache Flink", "Проверка контракта, дедупликация по event_id, обработка поздних событий, теги PII, маскирование", $tags="dq")
+    ContainerQueue(clean, "Kafka региона (clean)", "Kafka", "clean.* проверенные события, ключ = агрегат")
+    ContainerQueue(dlq, "Карантин (DLQ)", "Kafka", "Невалидные события с причиной. Алерт владельцу источника", $tags="dq")
+
+    Container(flink, "Stream Processing", "Apache Flink", "Агрегаты по H3-ячейкам, признаки для ML (окна 1 мин, 1 ч, 24 ч), обогащение")
+    Container(sink, "Kafka Connect Sinks", "S3 Sink, ClickHouse Sink", "Запись clean-потока в lake и ClickHouse")
+    Container(batch, "Batch Processing", "Spark + dbt", "Витрины, обучающие выборки, бэкфилл, сверка")
+    Container(orch, "Оркестратор", "Apache Airflow", "Расписания, зависимости, ретраи, запуск проверок качества")
+
+    ContainerDb(lake, "Data Lake региона", "S3 + Apache Iceberg", "bronze (сырые, 30 дней), silver (очищенные), gold (витрины)")
+    ContainerDb(ch, "ClickHouse региона", "ClickHouse", "Оперативная аналитика: агрегаты по минутам, поездки, платежи")
+    ContainerDb(online_fs, "Online Feature Store", "Redis (Feast online)", "Признаки с чтением менее 5 мс")
+
+    Container(serving, "Model Serving", "KServe", "Прогноз спроса и surge, скоринг Fraud. Canary и shadow-выкладка, p99 менее 50 мс", $tags="ml")
+    Container(psgate, "Pseudonymization Gate", "Flink + KMS", "Удаляет PII, хэширует идентификаторы региональной солью, пропускает только P2/P3 по политике экспорта", $tags="dq")
+}
+
+System_Boundary(consumers, "Потребители моделей (регион)") {
+    Container(pricing, "Pricing Service", "Python", "Цена и surge с учётом прогноза")
+    Container(fraud, "Fraud Service", "Python", "Решение по заказу и платежу")
+    Container(dispatch, "Dispatch Service", "Go", "Прогноз спроса для упреждающего распределения водителей")
+}
+
+System_Boundary(global, "Глобальный контур (только псевдонимизированные данные P2 и агрегаты P3)") {
+    ContainerQueue(gkafka, "Global Kafka", "Kafka", "Обезличенные события и агрегаты всех регионов")
+    ContainerDb(glake, "Global Lakehouse", "S3 + Apache Iceberg", "История для обучения и глобальной аналитики")
+    ContainerDb(gch, "Global ClickHouse", "ClickHouse", "Кросс-региональные отчёты")
+    Container(fs_off, "Offline Feature Store", "Feast + Iceberg", "Исторические признаки point-in-time (без утечки будущего)", $tags="ml")
+
+    System_Boundary(mlp, "ML-платформа") {
+        Container(nb, "Эксперименты", "JupyterHub", "Ноутбуки, выборки из Feature Store", $tags="ml")
+        Container(train, "Training Pipelines", "Spark / Python на Kubernetes", "Обучение, валидация, подбор гиперпараметров. Расписание и по дрейфу", $tags="ml")
+        Container(registry, "Model Registry", "MLflow", "Версии, метрики, одобрение (approval gate), lineage модели", $tags="ml")
+        Container(mlmon, "ML Monitoring", "Evidently + Prometheus", "Дрейф данных и предсказаний, качество на разметке, алерты", $tags="ml")
+    }
+
+    Container(bi, "BI", "Yandex DataLens", "Дашборды, row-level security по тенанту и региону (Task5)", $tags="bi")
+}
+
+System_Boundary(gov, "Управление данными") {
+    Container(dq, "Data Quality", "Great Expectations / Soda, dbt tests", "Правила полноты, валидности, уникальности, свежести, согласованности. Блокируют публикацию слоя при провале", $tags="dq")
+    Container(dobs, "Data Observability", "Метрики свежести, объёма, дрейфа схем", "Аномалии объёма и свежести, SLA наборов данных", $tags="dq")
+    Container(catalog, "Каталог и Lineage", "DataHub + OpenLineage", "Владельцы, классификация PII, происхождение данных от источника до дашборда", $tags="dq")
+}
+
+Rel(svc, kafka, "Доменные события (outbox)")
+Rel(oltp, cdc, "WAL")
+Rel(cdc, kafka, "cdc.* топики")
+Rel(apps, kafka, "Телеметрия (батчи)")
+Rel(ext, batch, "Загрузка по расписанию")
+
+Rel(kafka, validator, "Raw-события")
+Rel(sreg, validator, "Схемы и ограничения")
+Rel(validator, clean, "Валидные события", $tags="hot")
+Rel(validator, dlq, "Невалидные")
+Rel(clean, flink, "Поток", $tags="hot")
+Rel(flink, online_fs, "Признаки (запись)", $tags="hot")
+Rel(flink, clean, "Агрегаты и признаки (clean.agg.*)")
+Rel(clean, sink, "Все clean-события")
+Rel(sink, lake, "Parquet (bronze), партиции по часу")
+Rel(sink, ch, "Вставка пачками (near real-time)")
+Rel(batch, lake, "Чтение bronze, запись silver и gold")
+Rel(batch, ch, "Витрины")
+Rel(orch, batch, "Запуск")
+Rel(orch, dq, "Проверки после каждого слоя")
+
+Rel(clean, psgate, "Нужные события и агрегаты")
+Rel(lake, psgate, "Выгрузка обучающих наборов")
+Rel(psgate, gkafka, "Только P2 и P3", "mTLS", $tags="hot")
+Rel(gkafka, glake, "Sink")
+Rel(gkafka, gch, "Sink")
+Rel(glake, fs_off, "Материализация признаков")
+Rel(fs_off, online_fs, "Синхронизация (materialize)")
+Rel(fs_off, nb, "Обучающие выборки")
+Rel(nb, train, "Промоушен эксперимента в пайплайн")
+Rel(glake, train, "Данные")
+Rel(train, registry, "Модель и метрики")
+Rel(registry, serving, "Выкладка в регионы (canary, shadow)")
+Rel(online_fs, serving, "Признаки онлайн", $tags="hot")
+Rel(serving, mlmon, "Предсказания и метрики")
+Rel(mlmon, train, "Триггер переобучения при дрейфе")
+
+Rel(pricing, serving, "Прогноз спроса и surge (gRPC)", $tags="hot")
+Rel(fraud, serving, "Скоринг (gRPC)", $tags="hot")
+Rel(dispatch, serving, "Прогноз спроса (gRPC)")
+
+Rel(gch, bi, "SQL")
+Rel(ch, bi, "SQL (региональные отчёты, данные остаются в регионе)")
+Rel(analyst, bi, "Использует")
+Rel(ds, nb, "Использует")
+
+Rel(dq, lake, "Проверки", $tags="gov")
+Rel(dq, ch, "Проверки", $tags="gov")
+Rel(dq, glake, "Проверки", $tags="gov")
+Rel(dobs, kafka, "Лаг, объём, DLQ", $tags="gov")
+Rel(dobs, lake, "Свежесть и объём", $tags="gov")
+Rel(catalog, lake, "Метаданные и PII-теги", $tags="gov")
+Rel(catalog, batch, "Lineage (OpenLineage)", $tags="gov")
+Rel(catalog, flink, "Lineage (OpenLineage)", $tags="gov")
+Rel(catalog, bi, "Lineage до дашборда", $tags="gov")
+
+SHOW_LEGEND()
+@enduml
