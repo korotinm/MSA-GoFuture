@@ -43,7 +43,7 @@ System_Boundary(region, "Регион (SGP, JKT, GRU, SCL: одинаковый 
 
     Container(egress, "Egress Gateway", "Envoy", "Единственный выход к внешним провайдерам: allowlist, mTLS к внутренним, аудит вызовов", $tags="new")
 
-    ContainerDb(pg, "PostgreSQL по сервисам", "Patroni, 3 зоны", "Синхронная реплика в соседней зоне (RPO 0). TDE и шифрование томов ключами региона")
+    ContainerDb(pg, "PostgreSQL по сервисам", "Patroni, 3 зоны", "Синхронная реплика в соседней зоне (RPO 0). Шифрование томов ключами региона (при необходимости pg_tde)")
     ContainerQueue(kafka, "Kafka региона", "RF=3, MM2", "События, outbox")
     ContainerDb(redis, "Redis Cluster", "Geo-индекс", "Не реплицируется между регионами")
     ContainerDb(ch, "ClickHouse", "ReplicatedMergeTree", "Аналитика региона")
