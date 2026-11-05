@@ -1,0 +1,94 @@
+@startuml
+title Сага бронирования поездки (оркестрация в Booking Service)
+
+skinparam defaultFontName Arial
+skinparam sequenceMessageAlign center
+skinparam responseMessageBelowArrow true
+autonumber
+
+actor "Пассажир" as pax
+participant "API Gateway" as gw
+participant "Booking Service\n(оркестратор)" as bk
+participant "Pricing" as pr
+participant "Fraud" as fr
+queue "Kafka" as k
+participant "Payments" as pay
+participant "Dispatch" as dsp
+participant "Notification" as nt
+
+== Предусловия без побочных эффектов (синхронно, без компенсаций) ==
+pax -> gw : POST /v2/bookings (quote_token, Idempotency-Key)
+gw -> bk : создать заказ
+bk -> pr : gRPC ValidateQuote(quote_token)
+pr --> bk : цена подтверждена (подписанный токен, TTL 2 мин)
+bk -> fr : gRPC CheckBooking (таймаут 150 мс)
+alt Fraud отклонил
+  fr --> bk : FraudCheckRejected
+  bk --> gw : 403 / BookingRejected
+  gw --> pax : заказ отклонён
+else Fraud принял или недоступен (fail-open в лимите суммы)
+  fr --> bk : FraudCheckPassed
+end
+
+== Шаг 1. Создание заказа (локальная транзакция) ==
+bk -> bk : INSERT booking(PENDING) + saga_instance(step=PAYMENT_HOLD, deadline=+30 с) + outbox
+bk -> k : BookingCreated (через outbox/Debezium)
+bk --> gw : 202 Accepted (booking_id)
+gw --> pax : заказ принят
+
+== Шаг 2. Холд оплаты ==
+bk -> k : PaymentAuthorizationRequested (команда)
+k -> pay : команда
+pay -> pay : идемпотентность по booking_id, холд у PSP
+alt холд получен
+  pay -> k : PaymentAuthorized
+  k -> bk : PaymentAuthorized
+else отказ PSP или таймаут шага
+  pay -> k : PaymentAuthorizationFailed
+  k -> bk : PaymentAuthorizationFailed
+  bk -> bk : booking = CANCELLED, saga = COMPENSATED
+  bk -> k : BookingCancelled (причина: payment)
+  k -> nt : NotificationRequested
+  nt --> pax : не удалось провести оплату
+end
+
+== Шаг 3. Поиск и назначение водителя ==
+bk -> k : DriverSearchRequested (команда, TTL 90 с)
+k -> dsp : команда
+dsp -> dsp : отложенное назначение (окно 2-5 с), учёт горячих зон
+dsp -> k : DriverOfferSent
+alt водитель принял
+  dsp -> k : DriverAssigned
+  k -> bk : DriverAssigned
+  bk -> bk : booking = CONFIRMED, saga = COMPLETED
+  bk -> k : BookingConfirmed
+  k -> nt : NotificationRequested
+  nt --> pax : водитель назначен
+else водитель не найден или истёк TTL
+  dsp -> k : DriverNotFound
+  k -> bk : DriverNotFound
+  == Компенсация ==
+  bk -> k : PaymentHoldReleaseRequested (команда)
+  k -> pay : команда
+  pay -> k : PaymentHoldReleased
+  k -> bk : PaymentHoldReleased
+  bk -> bk : booking = CANCELLED, saga = COMPENSATED
+  bk -> k : BookingCancelled (причина: no_driver)
+  k -> nt : NotificationRequested
+  nt --> pax : водитель не найден
+end
+
+== Завершение поездки (хореография, не часть блокирующей саги) ==
+bk -> k : TripCompleted
+k -> pay : TripCompleted
+pay -> k : PaymentCaptured (итоговая сумма)
+pay -> k : PayoutScheduled
+k -> nt : чек пассажиру и уведомление водителю
+
+note over bk
+  Reaper-задача каждые 5 с находит saga_instance
+  с истёкшим дедлайном и запускает компенсацию.
+  Обработчики идемпотентны: дубликат команды или
+  события не меняет результат (inbox по event_id).
+end note
+@enduml

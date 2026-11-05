@@ -1,0 +1,58 @@
+@startuml
+title GoFuture To-Be: геомаршрутизация пользователей к ближайшему региону
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddRelTag("roam", $lineColor="#7030A0", $textColor="#7030A0", $lineStyle=DashedLine(), $legendText="Роуминг: аккаунт в другом регионе")
+AddRelTag("fail", $lineColor="#C00000", $textColor="#C00000", $lineStyle=DottedLine(), $legendText="Резервный путь при отказе региона")
+
+Person(user, "Пассажир / водитель", "Находится в одном из городов ЮВА или Южной Америки")
+
+Container(app, "Мобильное приложение", "iOS / Android / Huawei", "Хранит home_region и список endpoint по приоритету. Failover на стороне клиента: тайм-аут 3 с, затем следующий endpoint")
+Container(boot, "Bootstrap-конфиг", "CDN, статический JSON", "Список регионов, endpoint, приоритеты и признаки деградации. Доступен даже при падении API")
+
+System_Boundary(edge, "Глобальный edge") {
+    Container(geodns, "Geo DNS", "Anycast DNS", "Политика: geo + latency + health. TTL 30 с. Второй DNS-провайдер как резерв")
+    Container(waf, "CDN + WAF + DDoS", "Anycast", "Ближайший PoP. Правила маршрутизации по стране, заголовку X-Region и префиксу trip_id")
+    Container(hc, "Health Checker", "Синтетические пробы из 3+ точек", "Глубокая проверка /healthz каждые 10 с (включает БД, Kafka, брокер). Отключение региона через 3 провала подряд")
+    ContainerDb(dir, "Routing Directory", "Edge KV", "user_id -> home_region, region -> статус. Без PII. Реплика во всех PoP")
+}
+
+System_Boundary(sea, "Юго-Восточная Азия") {
+    Container(ing_sgp, "Ingress SGP", "L7 LB + API Gateway", "SG, MY, TH, VN, PH")
+    Container(ing_jkt, "Ingress JKT", "L7 LB + API Gateway", "ID")
+}
+
+System_Boundary(sa, "Южная Америка") {
+    Container(ing_gru, "Ingress GRU", "L7 LB + API Gateway", "BR, AR, UY, PY, CO, EC")
+    Container(ing_scl, "Ingress SCL", "L7 LB + API Gateway", "CL, PE, BO")
+}
+
+Rel(user, app, "Использует")
+Rel(app, boot, "1. Загрузка списка регионов (кэш 1 ч)", "HTTPS")
+Rel(app, geodns, "2. Резолв api.gofuture.com", "DNS")
+Rel(geodns, waf, "3. Ближайший здоровый PoP (anycast)")
+Rel(hc, geodns, "Статус регионов: исключает больные")
+Rel(hc, ing_sgp, "Пробы /healthz")
+Rel(hc, ing_jkt, "Пробы /healthz")
+Rel(hc, ing_gru, "Пробы /healthz")
+Rel(hc, ing_scl, "Пробы /healthz")
+Rel(waf, dir, "4. Поиск home_region по JWT (user_id), для поездки по префиксу trip_id", "KV")
+Rel(waf, ing_sgp, "5. Правила: JWT.home_region -> trip_id.region -> geo по IP -> ближайший здоровый регион того же юрисдикционного блока")
+Rel(waf, ing_jkt, "5. то же")
+Rel(waf, ing_gru, "5. то же")
+Rel(waf, ing_scl, "5. то же")
+
+Rel(ing_sgp, ing_jkt, "Резерв: failover внутри блока ЮВА", $tags="fail")
+Rel(ing_jkt, ing_sgp, "Резерв: failover внутри блока ЮВА", $tags="fail")
+Rel(ing_gru, ing_scl, "Резерв: failover внутри блока Южной Америки", $tags="fail")
+Rel(ing_scl, ing_gru, "Резерв: failover внутри блока Южной Америки", $tags="fail")
+Rel(ing_jkt, ing_sgp, "Роуминг: проверка аккаунта у home-региона (подписанные claims, без PII, только чтение)", $tags="roam")
+Rel(app, ing_sgp, "Прямой резервный endpoint из bootstrap, если DNS или edge недоступны", $tags="fail")
+
+SHOW_LEGEND()
+@enduml

@@ -1,0 +1,140 @@
+@startuml
+title GoFuture To-Be: C2 (Container Diagram) - целевая микросервисная архитектура и слой обратной совместимости
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("compat", $bgColor="#FFF2CC", $borderColor="#D6B656", $fontColor="#000000", $legendText="Механизмы обратной совместимости")
+AddElementTag("legacy", $bgColor="#E0E0E0", $borderColor="#808080", $fontColor="#000000", $legendText="Legacy-монолит (сокращается до нуля)")
+AddRelTag("compat_rel", $lineColor="#B8860B", $textColor="#996600", $lineStyle=DashedLine(), $legendText="Путь через слой совместимости")
+
+Person(passenger, "Пассажир", "Заказывает и оплачивает поездки")
+Person(driver, "Водитель", "Принимает заказы, получает выплаты")
+Person(manager, "Корпоративный менеджер", "Управляет поездками и счетами")
+Person(accountant, "Бухгалтер", "Контролирует выплаты водителям")
+Person(sre, "SRE / разработчик", "Эксплуатация и доставка изменений")
+
+System_Boundary(gf, "GoFuture Platform (Kubernetes, мультирегион)") {
+
+    Container(pax_app, "Пассажирское приложение", "iOS / Android / Huawei", "Нативное. Старые версии живут до 12+ месяцев")
+    Container(drv_app, "Водительское приложение", "iOS / Android / Huawei", "Нативное")
+    Container(corp_portal, "Корпоративный портал", "React / Vue", "Веб-интерфейс корпоративных клиентов")
+    Container(admin_portal, "Админ-панель", "Web", "Выплаты, справочники")
+
+    Container(gw, "API Gateway", "Envoy / Kong", "Единая точка входа. Strangler-маршрутизация по пути, тенанту и feature flag. Версионирование API (/v1 заморожен), rate limit, JWT-валидация", $tags="compat")
+    Container(iam, "IAM", "Keycloak (OIDC / OAuth2)", "Аутентификация, выпуск JWT, SSO")
+
+    Boundary(bc_legacy, "Слой совместимости") {
+        Container(adapter, "Legacy Adapter (ACL)", "Python", "Anti-Corruption Layer: переводит контракты старого REST/Celery в вызовы и события новых сервисов и обратно", $tags="compat")
+        Container(cdc, "CDC", "Debezium", "Читает WAL монолитной БД, публикует изменения в Kafka. Первичная заливка и догон", $tags="compat")
+        Container(schema_reg, "Schema Registry", "Confluent-совместимый", "Контракты событий, проверка BACKWARD-совместимости в CI", $tags="compat")
+    }
+
+    Boundary(bc_legacy_old, "Legacy") {
+        Container(monolith, "GoFuture Monolith", "Django, Celery, Gunicorn", "Остаточные модули, ещё не выделенные в сервисы", $tags="legacy")
+        ContainerDb(legacy_db, "PostgreSQL (legacy)", "PostgreSQL RDS", "Единая БД монолита. Источник истины для невыделенных доменов", $tags="legacy")
+        ContainerQueue(rabbit, "RabbitMQ", "AMQP", "Только для Celery-задач монолита", $tags="legacy")
+    }
+
+    Boundary(domains, "Доменные сервисы (по одному на продуктовую команду)") {
+        Container(booking, "Booking Service", "Python / FastAPI", "Заказы и жизненный цикл поездки, оркестратор саги бронирования")
+        ContainerDb(booking_db, "Booking DB", "PostgreSQL", "Заказы, поездки, outbox")
+
+        Container(driver_svc, "Driver Service", "Python / FastAPI", "Профили, статусы и доступность водителей")
+        ContainerDb(driver_db, "Driver DB", "PostgreSQL", "Профили, документы, статусы")
+
+        Container(dispatch, "Dispatch Service", "Go", "Подбор водителя: отложенное назначение вместо ближайшего, антигорячие зоны")
+
+        Container(pricing, "Pricing Service", "Python / FastAPI", "Тарифы и динамическое ценообразование (surge по H3-ячейкам)")
+        ContainerDb(pricing_db, "Pricing DB", "PostgreSQL", "Тарифные планы, правила тенантов")
+
+        Container(payments, "Payments Service", "Python / FastAPI", "Платежи, холды, возвраты, выплаты водителям, леджер")
+        ContainerDb(payments_db, "Payments DB", "PostgreSQL", "Леджер, платежи, outbox")
+
+        Container(notification, "Notification Service", "Python", "Push, SMS, email: маршрутизация по каналам")
+        ContainerDb(notif_db, "Notification DB", "PostgreSQL", "Шаблоны, токены устройств, статусы доставки")
+
+        Container(geo, "Geography Service", "Go", "Приём геопозиций, гео-индекс, маршруты и геокодинг")
+        ContainerDb(geo_idx, "Geo Index", "Redis Cluster", "Позиции водителей в H3-ячейках, TTL")
+
+        Container(fraud, "Fraud Service", "Python + ML-serving", "Скоринг заказов и платежей в реальном времени")
+
+        Container(analytics, "Analytics Service", "Python / Flink", "Потоковая и пакетная аналитика, витрины")
+        ContainerDb(clickhouse, "ClickHouse", "ClickHouse", "Аналитическое хранилище")
+    }
+
+    ContainerQueue(kafka, "Event Bus", "Apache Kafka", "Доменные события, outbox-доставка, CDC-топики")
+
+    Boundary(plat, "Платформа") {
+        Container(obs, "Observability", "Prometheus, Grafana, Loki, Alertmanager", "Метрики, логи, алерты (расширяется в Task2)")
+        Container(cicd, "CI/CD", "Jenkins + Argo CD", "Сборка на сервис (< 5 мин), GitOps-деплой, канареечные выкладки")
+    }
+}
+
+System_Ext(pay_psp, "Платёжные провайдеры", "Яндекс Пэй и локальные PSP (через абстракцию провайдера)")
+System_Ext(maps, "Картографические сервисы", "Яндекс Карты и локальные провайдеры")
+System_Ext(push, "Push-сервисы", "FCM, APNS, Huawei Push Kit")
+System_Ext(bank, "API банков", "Выплаты водителям")
+
+Rel(passenger, pax_app, "Использует")
+Rel(driver, drv_app, "Использует")
+Rel(manager, corp_portal, "Использует")
+Rel(accountant, admin_portal, "Использует")
+Rel(sre, cicd, "Выкладывает изменения")
+Rel(sre, obs, "Мониторит, настраивает алерты")
+
+Rel(pax_app, gw, "HTTPS / REST (v1, v2)")
+Rel(drv_app, gw, "HTTPS / REST, WebSocket")
+Rel(corp_portal, gw, "HTTPS / REST")
+Rel(admin_portal, gw, "HTTPS / REST")
+Rel(gw, iam, "Валидация токенов, OIDC")
+
+Rel(gw, booking, "Маршрут /bookings, /trips (новый)")
+Rel(gw, driver_svc, "Маршрут /drivers")
+Rel(gw, pricing, "Маршрут /quotes")
+Rel(gw, payments, "Маршрут /payments")
+Rel(gw, geo, "Маршрут /locations (ingest)")
+Rel(gw, adapter, "Ещё не выделенные пути и старые версии API", $tags="compat_rel")
+Rel(adapter, monolith, "Legacy REST", $tags="compat_rel")
+Rel(adapter, kafka, "Публикует и потребляет события, транслирует контракты", $tags="compat_rel")
+
+Rel(monolith, legacy_db, "ORM")
+Rel(monolith, rabbit, "Celery-задачи")
+Rel(legacy_db, cdc, "WAL (логическая репликация)", $tags="compat_rel")
+Rel(cdc, kafka, "legacy.* топики", $tags="compat_rel")
+Rel(kafka, schema_reg, "Проверка схем")
+
+Rel(booking, booking_db, "SQL + outbox")
+Rel(driver_svc, driver_db, "SQL")
+Rel(pricing, pricing_db, "SQL")
+Rel(payments, payments_db, "SQL + outbox")
+Rel(notification, notif_db, "SQL")
+Rel(geo, geo_idx, "GEO / H3 индекс")
+Rel(dispatch, geo, "Поиск кандидатов (gRPC)")
+Rel(analytics, clickhouse, "Загрузка и запросы")
+
+Rel(booking, kafka, "BookingCreated, TripStarted, ...")
+Rel(driver_svc, kafka, "DriverStatusChanged")
+Rel(geo, kafka, "DriverLocationUpdated")
+Rel(dispatch, kafka, "DriverOffer*, DriverAssigned")
+Rel(pricing, kafka, "SurgeUpdated, PriceQuoted")
+Rel(payments, kafka, "Payment*, Payout*")
+Rel(fraud, kafka, "FraudCheck*")
+Rel(kafka, notification, "NotificationRequested")
+Rel(kafka, analytics, "Все доменные события")
+Rel(booking, pricing, "Котировка цены (gRPC)")
+Rel(booking, fraud, "Проверка заказа (gRPC)")
+
+Rel(payments, pay_psp, "Авторизация, capture, refund")
+Rel(geo, maps, "Маршруты, геокодинг")
+Rel(notification, push, "Push")
+Rel(payments, bank, "Выплаты")
+
+Rel(cicd, booking, "Деплой")
+Rel_U(obs, kafka, "Метрики брокера")
+
+SHOW_LEGEND()
+@enduml

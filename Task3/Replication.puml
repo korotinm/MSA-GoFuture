@@ -1,0 +1,62 @@
+@startuml
+title GoFuture To-Be: схема репликации данных между регионами (пара SGP - JKT, для LatAm пара GRU - SCL устроена так же)
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("standby", $bgColor="#EDEDED", $borderColor="#7F7F7F", $fontColor="#000000", $legendText="Реплика / standby")
+AddElementTag("noRepl", $bgColor="#FFF2CC", $borderColor="#BF9000", $fontColor="#000000", $legendText="Не реплицируется между регионами")
+AddRelTag("sync", $lineColor="#1F4E79", $textColor="#1F4E79", $lineThickness="3", $legendText="Синхронно (внутри региона, между зонами)")
+AddRelTag("async", $lineColor="#7030A0", $textColor="#7030A0", $lineStyle=DashedLine(), $lineThickness="2", $legendText="Асинхронно (между регионами)")
+
+System_Boundary(sgp, "Регион SGP (primary для SG, MY, TH, VN, PH)") {
+    ContainerDb(sgp_pg, "Операционные PostgreSQL", "Patroni, 3 зоны", "Booking, Driver, Payments. Лидер + синхронная реплика в другой зоне + асинхронная")
+    ContainerDb(sgp_pg_x, "Hot standby JKT-БД", "PostgreSQL replica", "Реплика операционных БД JKT (только чтение)", $tags="standby")
+    ContainerQueue(sgp_k, "Kafka SGP", "RF=3, 3 зоны", "Топики региона")
+    ContainerQueue(sgp_k_x, "Зеркало топиков JKT", "MirrorMaker 2", "jkt.booking.events.v1, jkt.payments.events.v1 и др.", $tags="standby")
+    ContainerDb(sgp_redis, "Redis Geo", "Redis Cluster", "Позиции водителей региона. Восстановление из потока за 1-2 мин", $tags="noRepl")
+    ContainerDb(sgp_ch, "ClickHouse SGP", "ReplicatedMergeTree", "Аналитика региона. Реплики по зонам", $tags="noRepl")
+    ContainerDb(sgp_s3, "Объектное хранилище SGP", "S3-совместимое", "Документы, архив событий, checkpoints. Версионирование")
+    ContainerDb(sgp_cp, "Control Plane (реплика)", "PostgreSQL, logical replication", "Тенанты, тарифные правила, флаги. Только чтение", $tags="standby")
+}
+
+System_Boundary(jkt, "Регион JKT (primary для ID, DR для SGP)") {
+    ContainerDb(jkt_pg, "Операционные PostgreSQL", "Patroni, 3 зоны", "Booking, Driver, Payments Индонезии")
+    ContainerDb(jkt_pg_x, "Hot standby SGP-БД", "PostgreSQL replica", "Реплика операционных БД SGP (только чтение)", $tags="standby")
+    ContainerQueue(jkt_k, "Kafka JKT", "RF=3, 3 зоны", "Топики региона")
+    ContainerQueue(jkt_k_x, "Зеркало топиков SGP", "MirrorMaker 2", "sgp.booking.events.v1, sgp.payments.events.v1 и др.", $tags="standby")
+    ContainerDb(jkt_redis, "Redis Geo", "Redis Cluster", "Позиции водителей региона", $tags="noRepl")
+    ContainerDb(jkt_ch, "ClickHouse JKT", "ReplicatedMergeTree", "Аналитика региона", $tags="noRepl")
+    ContainerDb(jkt_s3, "Объектное хранилище JKT", "S3-совместимое", "Документы, архив. Остаётся в стране")
+    ContainerDb(jkt_cp, "Control Plane (реплика)", "PostgreSQL, logical replication", "Тенанты, тарифные правила, флаги. Только чтение", $tags="standby")
+}
+
+System_Boundary(glob, "Глобальный контур") {
+    ContainerDb(cp, "Control Plane (primary)", "PostgreSQL", "Тенанты, тарифные правила, флаги. Единственный писатель. Standby в другом континенте")
+    ContainerDb(dir, "Identity Directory", "Edge KV / реплицируемая таблица", "user_id -> home_region, без PII. Реплицируется во все регионы")
+    ContainerQueue(gk, "Global Analytics Kafka", "Kafka", "Только обезличенные агрегаты")
+    ContainerDb(dwh, "Global DWH", "ClickHouse", "Глобальные отчёты, ML-обучение на агрегатах")
+}
+
+Rel(sgp_pg, sgp_pg, "Синхронная репликация лидер -> реплика в другой зоне (RPO 0)", $tags="sync")
+Rel(sgp_pg, jkt_pg_x, "Streaming replication, RPO <= 5 с", $tags="async")
+Rel(jkt_pg, sgp_pg_x, "Streaming replication, RPO <= 5 с", $tags="async")
+Rel(sgp_k, jkt_k_x, "MM2: booking, payments, dispatch + трансляция офсетов", $tags="async")
+Rel(jkt_k, sgp_k_x, "MM2: booking, payments, dispatch + трансляция офсетов", $tags="async")
+Rel(sgp_s3, jkt_s3, "Репликация объектов только неперсональных данных и архива без PII", $tags="async")
+
+Rel(cp, sgp_cp, "Logical replication, лаг обычно < 2 с", $tags="async")
+Rel(cp, jkt_cp, "Logical replication", $tags="async")
+Rel(dir, sgp_cp, "Репликация каталога маршрутизации", $tags="async")
+Rel(dir, jkt_cp, "Репликация каталога маршрутизации", $tags="async")
+
+Rel(sgp_k, gk, "Агрегаты без PII (MM2 + фильтр + псевдонимизация)", $tags="async")
+Rel(jkt_k, gk, "Агрегаты без PII", $tags="async")
+Rel(gk, dwh, "Загрузка")
+Rel(sgp_redis, sgp_k, "Восстановление индекса из driver.location при потере")
+
+SHOW_LEGEND()
+@enduml

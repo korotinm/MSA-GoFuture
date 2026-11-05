@@ -1,0 +1,132 @@
+@startuml
+title GoFuture To-Be: C2 мультитенантной платформы - IAM, мониторинг, потоки данных и онбординг партнёров (шаги O1-O10)
+
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+skinparam defaultFontName Arial
+skinparam ArrowColor #444444
+!pragma layout elk
+
+AddElementTag("iam", $bgColor="#DDEBF7", $borderColor="#2E75B6", $fontColor="#000000", $legendText="IAM и политики доступа")
+AddElementTag("onb", $bgColor="#FFF2CC", $borderColor="#BF9000", $fontColor="#000000", $legendText="Онбординг и управление тенантами")
+AddElementTag("mon", $bgColor="#E2F0D9", $borderColor="#548235", $fontColor="#000000", $legendText="Мониторинг и аудит")
+AddRelTag("onb_rel", $lineColor="#BF9000", $textColor="#7F6000", $lineThickness="3", $legendText="Шаги онбординга O1-O10")
+AddRelTag("mon_rel", $lineColor="#548235", $textColor="#385723", $lineStyle=DashedLine(), $legendText="Телеметрия, аудит, метрики использования")
+AddRelTag("auth_rel", $lineColor="#2E75B6", $textColor="#1F4E79", $lineStyle=DottedLine(), $legendText="Аутентификация и авторизация")
+
+Person(partner_admin, "Администратор партнёра", "Подаёт заявку, настраивает тенант, управляет пользователями")
+Person(partner_staff, "Сотрудники партнёра", "Диспетчер, финансы, аналитик, поддержка")
+Person(partner_dev, "Разработчик партнёра", "Интеграция по API, вебхуки, песочница")
+Person(end_user, "Пассажиры и водители партнёра", "Клиенты тенанта")
+Person(gf_staff, "Администратор GoFuture, SRE, поддержка", "Платформа и поддержка партнёров")
+Person(compliance, "Compliance officer", "Проверка KYB, обработка запросов субъектов данных")
+
+System_Ext(partner_idp, "IdP партнёра", "Azure AD, Google Workspace, Okta (SAML / OIDC)")
+System_Ext(kyb, "KYB / KYC-провайдер", "Проверка юрлица и бенефициаров")
+System_Ext(partner_sys, "Системы партнёра", "ERP, банки, CRM: вебхуки и API")
+
+System_Boundary(platform, "GoFuture Platform (регион; control plane глобальный)") {
+
+    Boundary(front, "Клиентские точки входа") {
+        Container(partner_portal, "Partner Portal", "React", "Самообслуживание: заявка, статус онбординга, пользователи, роли, тарифы, дашборды SLA тенанта", $tags="onb")
+        Container(dev_portal, "Developer Portal", "Web", "Документация, ключи API, песочница, логи вебхуков")
+        Container(apps, "Клиентские приложения (white-label)", "iOS / Android / Web", "Бренд и настройки тенанта из конфигурации")
+    }
+
+    Container(gw, "API Gateway", "Envoy / Kong", "Определяет тенанта (JWT, API-ключ, хост), подписывает x-tenant-id, квоты и rate limit по тенанту, запрос решения в OPA", $tags="iam")
+
+    Boundary(iam_b, "IAM") {
+        Container(keycloak, "IAM", "Keycloak", "Realm на регион, Organization = тенант. Брокер внешних IdP (SSO SAML и OIDC), SCIM 2.0, MFA, OAuth2 client credentials для API, короткие токены (5-15 мин)", $tags="iam")
+        Container(opa, "Policy Decision Point", "Open Policy Agent", "RBAC и ABAC: роль, tenant_id, регион, класс данных, MFA, время. Политики как код в Git", $tags="iam")
+    }
+
+    Boundary(onb_b, "Управление тенантами и онбординг") {
+        Container(tenant_svc, "Tenant Service", "Python", "Реестр тенантов: статус, тариф изоляции (pool или silo), регион, квоты, флаги функций", $tags="onb")
+        ContainerDb(registry, "Tenant Registry & Config", "PostgreSQL (Control Plane)", "Тенанты, конфигурация, шаблоны тарифов. Реплики в регионах", $tags="onb")
+        Container(orchestrator, "Onboarding Orchestrator", "Temporal", "Долгий процесс онбординга: шаги, ретраи, ручные задачи, компенсации", $tags="onb")
+        Container(provisioner, "Provisioning Controller", "Crossplane / Terraform + Argo CD (GitOps)", "Создаёт ресурсы изоляции: БД, топики, ключи, namespace, политики", $tags="onb")
+    }
+
+    Boundary(svcs, "Доменные сервисы (tenant-aware)") {
+        Container(domain, "Booking, Dispatch, Driver, Pricing, Payments, Notification, Fraud", "Python / Go", "Контекст тенанта из заголовка и токена. Устанавливают app.tenant_id в БД, tenant_id в каждое событие")
+        Container(usage, "Usage Metering", "Python + Flink", "Считает использование по тенанту (поездки, API-вызовы, события, хранение) для биллинга и FinOps", $tags="mon")
+    }
+
+    Boundary(data, "Данные: модель изоляции pool + silo") {
+        ContainerDb(pool_pg, "PostgreSQL (pool)", "Patroni, RLS", "Общий кластер, tenant_id в каждой таблице, Row-Level Security")
+        ContainerDb(silo_pg, "PostgreSQL (silo)", "Выделенные кластеры", "Для regulated и крупных тенантов, свой ключ KMS")
+        ContainerQueue(kafka, "Kafka", "Kafka", "Общие топики (tenant_id в конверте) и выделенные t.<tenant>.* для silo. Квоты по клиенту")
+        ContainerDb(ch, "ClickHouse", "Row policies", "Аналитика, row policy по tenant_id, квоты запросов")
+        ContainerDb(s3, "Объектное хранилище", "SSE-KMS", "Префикс или бакет тенанта, ключ тенанта")
+    }
+
+    Container(vault, "Vault + KMS", "HashiCorp Vault / KMS", "Секреты, динамические креды БД, ключи данных по тенанту (envelope), BYOK для enterprise", $tags="iam")
+
+    Boundary(mon_b, "Мониторинг и аудит мультитенантного окружения") {
+        Container(metrics, "Метрики", "Prometheus + Thanos + prom-label-proxy", "Метрики сервисов и SLO. Доступ тенанта только через принудительный фильтр tenant_id", $tags="mon")
+        Container(loki, "Логи и трейсы", "Loki + Tempo", "tenant_id в каждой записи. Мультитенантный режим для silo", $tags="mon")
+        Container(grafana, "Grafana", "Grafana", "Дашборды SLA по тенанту (папка или org), встраивание в Partner Portal", $tags="mon")
+        Container(alertmgr, "Alertmanager", "Alertmanager", "Маршрутизация алертов: SRE (платформа) и контакты партнёра (SLO и квоты)", $tags="mon")
+        Container(siem, "SIEM и аудит", "Audit logs + SIEM, WORM", "Вход и выход, действия админов, доступ к PII, попытки cross-tenant доступа", $tags="mon")
+    }
+}
+
+Rel(partner_admin, partner_portal, "O1. Заявка на подключение (страна, тариф, функции)", $tags="onb_rel")
+Rel(partner_staff, apps, "Использует (SSO)")
+Rel(end_user, apps, "Использует")
+Rel(partner_dev, dev_portal, "Ключи API, песочница")
+Rel(gf_staff, grafana, "Мониторинг платформы")
+Rel(compliance, orchestrator, "O3. Ручная проверка KYB (human task)", $tags="onb_rel")
+
+Rel(partner_portal, gw, "REST", $tags="iam")
+Rel(apps, gw, "REST / WebSocket")
+Rel(dev_portal, gw, "REST")
+Rel(partner_sys, gw, "API партнёра (OAuth2 client credentials)")
+Rel(gw, keycloak, "Валидация токенов (JWKS), OIDC", $tags="auth_rel")
+Rel(gw, opa, "Решение: разрешить / запретить", $tags="auth_rel")
+Rel(keycloak, partner_idp, "SSO: брокер SAML / OIDC, SCIM-провижининг", $tags="auth_rel")
+Rel(gw, domain, "mTLS, x-tenant-id (подписан)")
+Rel(domain, opa, "Тонкие проверки: ABAC по данным", $tags="auth_rel")
+
+Rel(partner_portal, orchestrator, "O2. StartOnboarding(заявка)", $tags="onb_rel")
+Rel(orchestrator, tenant_svc, "O2. Создать тенанта (PENDING), тариф изоляции", $tags="onb_rel")
+Rel(tenant_svc, registry, "Запись")
+Rel(orchestrator, kyb, "O3. Проверка юрлица (async + webhook)", $tags="onb_rel")
+Rel(orchestrator, registry, "O4. Политика страны: регион, DR-схема, тариф изоляции", $tags="onb_rel")
+Rel(orchestrator, keycloak, "O5. Organization, роли, SSO, SCIM, OAuth-клиенты", $tags="onb_rel")
+Rel(orchestrator, provisioner, "O6. Провижининг изоляции (pool: политики, silo: ресурсы)", $tags="onb_rel")
+Rel(provisioner, pool_pg, "O6. RLS-политики, квоты, роли", $tags="onb_rel")
+Rel(provisioner, silo_pg, "O6. Создать кластер (tier = silo)", $tags="onb_rel")
+Rel(provisioner, kafka, "O6. Топики t.<tenant>.*, ACL, квоты", $tags="onb_rel")
+Rel(provisioner, vault, "O6. Ключи тенанта, секреты", $tags="onb_rel")
+Rel(orchestrator, registry, "O7. Конфигурация: тарифы, платёжные и карт-провайдеры, шаблоны, флаги", $tags="onb_rel")
+Rel(orchestrator, grafana, "O8. Дашборды SLA, алерты, пробы (as code)", $tags="onb_rel")
+Rel(orchestrator, domain, "O9. Smoke-тест в песочнице (синтетический заказ)", $tags="onb_rel")
+Rel(orchestrator, tenant_svc, "O10. Активация (ACTIVE), событие TenantOnboarded", $tags="onb_rel")
+Rel(orchestrator, partner_admin, "O10. Уведомление: доступ, SSO, ключи", $tags="onb_rel")
+Rel(registry, gw, "Конфигурация и квоты тенантов (кэш)")
+
+Rel(domain, pool_pg, "SQL, SET app.tenant_id")
+Rel(domain, silo_pg, "SQL (маршрут по тенанту)")
+Rel(domain, kafka, "События с tenant_id")
+Rel(kafka, ch, "Sink")
+Rel(domain, s3, "Документы")
+Rel(domain, vault, "Секреты, ключи данных", $tags="iam")
+Rel(domain, partner_sys, "Вебхуки (подписанные)")
+
+Rel(domain, metrics, "Метрики (tenant_id в агрегатах)", $tags="mon_rel")
+Rel(domain, loki, "Логи и трейсы", $tags="mon_rel")
+Rel(metrics, grafana, "Запросы", $tags="mon_rel")
+Rel(loki, grafana, "Запросы", $tags="mon_rel")
+Rel(metrics, alertmgr, "SLO burn rate, квоты", $tags="mon_rel")
+Rel(alertmgr, partner_admin, "Алерты по SLO и квотам тенанта", $tags="mon_rel")
+Rel(grafana, partner_portal, "Встроенные дашборды тенанта (только свой tenant_id)", $tags="mon_rel")
+Rel(kafka, usage, "События использования", $tags="mon_rel")
+Rel(gw, usage, "API-вызовы по тенанту", $tags="mon_rel")
+Rel(usage, ch, "Агрегаты использования", $tags="mon_rel")
+Rel(keycloak, siem, "События входа и админ-действий", $tags="mon_rel")
+Rel(gw, siem, "Отказы авторизации, cross-tenant попытки", $tags="mon_rel")
+Rel(opa, siem, "Решения политик (audit)", $tags="mon_rel")
+
+SHOW_LEGEND()
+@enduml
